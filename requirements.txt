@@ -1,0 +1,5 @@
+flask
+flask-socketio
+selenium
+python-socketio
+eventlet  # (ঐচ্ছিক, SocketIO-র জন্য)
