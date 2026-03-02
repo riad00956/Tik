@@ -1,5 +1,6 @@
 flask
 flask-socketio
-selenium
+playwright
+eventlet
+python-engineio
 python-socketio
-eventlet  # (ঐচ্ছিক, SocketIO-র জন্য)
