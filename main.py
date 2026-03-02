@@ -1,856 +1,806 @@
-#!/usr/bin/env python3
-"""
-TikTok Mirror Controller v3.0
-সম্পূর্ণ ফাংশনাল ভার্সন - Render-এর জন্য আপডেটেড
-"""
-
-from flask import Flask, render_template_string, jsonify
-from flask_socketio import SocketIO, emit
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+import os
 import threading
 import time
-import os
-import json
-import re
-from datetime import datetime
+from flask import Flask, render_template_string, request, jsonify
+from flask_socketio import SocketIO, emit
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'tiktok-secret-key'
-socketio = SocketIO(app, cors_allowed_origins="*")
+app.config['SECRET_KEY'] = os.environ.get('SESSION_SECRET', 'tiktok-mirror-secret')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# ============ কনফিগারেশন ============
-USER_DATA_DIR = os.path.join(os.getcwd(), "tiktok_session")
+USER_DATA_DIR = os.path.join(os.path.dirname(__file__), 'user_data')
 os.makedirs(USER_DATA_DIR, exist_ok=True)
 
-# ============ গ্লোবাল ভেরিয়েবল ============
-class TikTokBot:
-    def __init__(self):
-        self.driver = None
-        self.is_connected = False
-        self.is_running = False
-        self.stop_flag = False
-        self.visit_count = 0
-        self.username = None
-        self.current_url = None
-        self.wait = None
-        self.lock = threading.Lock()
+state = {
+    'stop_flag': False,
+    'is_running': False,
+    'visit_count': 0,
+    'connected': False,
+    'browser': None,
+    'context': None,
+    'page': None,
+    'loop_thread': None,
+}
+state_lock = threading.Lock()
+
+
+def get_playwright_browser(headed=True):
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    context = pw.chromium.launch_persistent_context(
+        USER_DATA_DIR,
+        headless=not headed,
+        args=[
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+        ]
+    )
+    return pw, context
 
-bot = TikTokBot()
 
-# ============ HTML টেমপ্লেট ============
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="bn">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>TikTok Mirror Controller</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <script src="https://cdn.socket.io/4.5.0/socket.io.min.js"></script>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-        }
-
-        body {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            padding: 20px;
-        }
-
-        .container {
-            max-width: 600px;
-            width: 100%;
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            overflow: hidden;
-        }
-
-        .header {
-            background: linear-gradient(135deg, #ff0050, #00f2fe);
-            color: white;
-            padding: 30px;
-            text-align: center;
-        }
-
-        .header h1 {
-            font-size: 28px;
-            margin-bottom: 10px;
-        }
-
-        .header p {
-            font-size: 14px;
-            opacity: 0.9;
-        }
-
-        .content {
-            padding: 30px;
-        }
-
-        .status-card {
-            background: #f8f9fa;
-            border-radius: 15px;
-            padding: 20px;
-            margin-bottom: 25px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            border-left: 5px solid #ff0050;
-        }
-
-        .status-info h3 {
-            font-size: 16px;
-            color: #666;
-            margin-bottom: 5px;
-        }
-
-        .status-info p {
-            font-size: 20px;
-            font-weight: bold;
-            color: #333;
-        }
-
-        .status-badge {
-            padding: 8px 20px;
-            border-radius: 50px;
-            font-size: 14px;
-            font-weight: 600;
-        }
-
-        .badge-connected {
-            background: #d4edda;
-            color: #155724;
-        }
-
-        .badge-disconnected {
-            background: #f8d7da;
-            color: #721c24;
-        }
-
-        .badge-running {
-            background: #cce5ff;
-            color: #004085;
-        }
-
-        .badge-stopped {
-            background: #fff3cd;
-            color: #856404;
-        }
-
-        .url-input {
-            margin-bottom: 20px;
-        }
-
-        .url-input label {
-            display: block;
-            margin-bottom: 8px;
-            color: #555;
-            font-weight: 600;
-        }
-
-        .url-input input {
-            width: 100%;
-            padding: 15px;
-            border: 2px solid #e0e0e0;
-            border-radius: 10px;
-            font-size: 16px;
-            transition: border-color 0.3s;
-        }
-
-        .url-input input:focus {
-            outline: none;
-            border-color: #ff0050;
-        }
-
-        .url-input input:disabled {
-            background: #f5f5f5;
-            cursor: not-allowed;
-        }
-
-        .button-group {
-            display: flex;
-            gap: 15px;
-            margin-bottom: 25px;
-        }
-
-        .btn {
-            flex: 1;
-            padding: 15px;
-            border: none;
-            border-radius: 10px;
-            font-size: 16px;
-            font-weight: 600;
-            cursor: pointer;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-            transition: all 0.3s;
-        }
-
-        .btn:disabled {
-            opacity: 0.5;
-            cursor: not-allowed;
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, #ff0050, #ff4d7d);
-            color: white;
-        }
-
-        .btn-primary:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(255,0,80,0.3);
-        }
-
-        .btn-success {
-            background: linear-gradient(135deg, #00f2fe, #4facfe);
-            color: white;
-        }
-
-        .btn-success:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(0,242,254,0.3);
-        }
-
-        .btn-danger {
-            background: linear-gradient(135deg, #ff4444, #ff6b6b);
-            color: white;
-        }
-
-        .btn-danger:hover:not(:disabled) {
-            transform: translateY(-2px);
-            box-shadow: 0 5px 20px rgba(255,68,68,0.3);
-        }
-
-        .btn-secondary {
-            background: #6c757d;
-            color: white;
-        }
-
-        .counter-box {
-            background: linear-gradient(135deg, #667eea, #764ba2);
-            border-radius: 15px;
-            padding: 30px;
-            text-align: center;
-            color: white;
-            margin-bottom: 20px;
-        }
-
-        .counter-label {
-            font-size: 18px;
-            margin-bottom: 10px;
-            opacity: 0.9;
-        }
-
-        .counter-number {
-            font-size: 72px;
-            font-weight: bold;
-            line-height: 1;
-        }
-
-        .progress-bar {
-            width: 100%;
-            height: 8px;
-            background: #e0e0e0;
-            border-radius: 4px;
-            overflow: hidden;
-            margin: 20px 0;
-            display: none;
-        }
-
-        .progress-bar.active {
-            display: block;
-        }
-
-        .progress-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #ff0050, #00f2fe);
-            animation: progress 1.5s ease-in-out infinite;
-            width: 100%;
-        }
-
-        @keyframes progress {
-            0% { transform: translateX(-100%); }
-            100% { transform: translateX(100%); }
-        }
-
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(2, 1fr);
-            gap: 15px;
-            margin-top: 20px;
-        }
-
-        .stat-item {
-            background: #f8f9fa;
-            border-radius: 10px;
-            padding: 15px;
-            text-align: center;
-        }
-
-        .stat-value {
-            font-size: 24px;
-            font-weight: bold;
-            color: #ff0050;
-            margin-bottom: 5px;
-        }
-
-        .stat-label {
-            color: #666;
-            font-size: 14px;
-        }
-
-        .toast {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            background: white;
-            border-radius: 10px;
-            padding: 15px 25px;
-            box-shadow: 0 5px 20px rgba(0,0,0,0.2);
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            transform: translateX(400px);
-            transition: transform 0.3s;
-            z-index: 1000;
-        }
-
-        .toast.show {
-            transform: translateX(0);
-        }
-
-        .toast.success { border-left: 4px solid #28a745; }
-        .toast.error { border-left: 4px solid #dc3545; }
-        .toast.warning { border-left: 4px solid #ffc107; }
-        .toast.info { border-left: 4px solid #17a2b8; }
-
-        .username {
-            background: #e8f5e9;
-            padding: 10px;
-            border-radius: 8px;
-            margin-top: 10px;
-            display: none;
-        }
-
-        .username.show {
-            display: block;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1><i class="fab fa-tiktok"></i> TikTok Mirror Controller</h1>
-            <p>প্রোফেশনাল অটোমেশন টুল | রিয়েল-টাইম কাউন্টার</p>
-        </div>
-
-        <div class="content">
-            <!-- স্ট্যাটাস কার্ড -->
-            <div class="status-card">
-                <div class="status-info">
-                    <h3>অ্যাকাউন্ট স্ট্যাটাস</h3>
-                    <p id="accountStatusText">ডিসকানেক্টেড</p>
-                </div>
-                <div class="status-badge" id="accountStatusBadge">● ডিসকানেক্টেড</div>
-            </div>
-
-            <!-- ইউজারনেম ডিসপ্লে -->
-            <div class="username" id="usernameDisplay">
-                <i class="fas fa-user-circle"></i> <span id="username">-</span>
-            </div>
-
-            <!-- কানেক্ট বাটন -->
-            <button class="btn btn-primary" id="connectBtn" onclick="connectAccount()" style="width: 100%; margin-bottom: 20px;">
-                <i class="fas fa-plug"></i> অ্যাকাউন্ট কানেক্ট
-            </button>
-
-            <!-- URL ইনপুট -->
-            <div class="url-input">
-                <label><i class="fas fa-link"></i> TikTok ভিডিও URL</label>
-                <input type="url" id="urlInput" placeholder="https://www.tiktok.com/@username/video/123456789" disabled>
-            </div>
-
-            <!-- কন্ট্রোল বাটন -->
-            <div class="button-group">
-                <button class="btn btn-success" id="startBtn" onclick="startAutomation()" disabled>
-                    <i class="fas fa-play"></i> শুরু
-                </button>
-                <button class="btn btn-danger" id="stopBtn" onclick="stopAutomation()" disabled>
-                    <i class="fas fa-stop"></i> বন্ধ
-                </button>
-            </div>
-
-            <!-- কাউন্টার -->
-            <div class="counter-box">
-                <div class="counter-label">মোট ভিজিট</div>
-                <div class="counter-number" id="counter">0</div>
-            </div>
-
-            <!-- প্রোগ্রেস বার -->
-            <div class="progress-bar" id="progressBar">
-                <div class="progress-fill"></div>
-            </div>
-
-            <!-- পরিসংখ্যান -->
-            <div class="stats-grid" id="statsGrid" style="display: none;">
-                <div class="stat-item">
-                    <div class="stat-value" id="successCount">0</div>
-                    <div class="stat-label">সফল</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value" id="failedCount">0</div>
-                    <div class="stat-label">ব্যর্থ</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value" id="successRate">0%</div>
-                    <div class="stat-label">সাফল্য</div>
-                </div>
-                <div class="stat-item">
-                    <div class="stat-value" id="sessionTime">00:00</div>
-                    <div class="stat-label">সময়</div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <div class="toast" id="toast">
-        <i class="fas" id="toastIcon"></i>
-        <span id="toastMessage"></span>
-    </div>
-
-    <script>
-        const socket = io();
-        let isConnected = false;
-        let isRunning = false;
-        let sessionTimer = null;
-        let sessionSeconds = 0;
-
-        // এলিমেন্ট রেফারেন্স
-        const elements = {
-            connectBtn: document.getElementById('connectBtn'),
-            startBtn: document.getElementById('startBtn'),
-            stopBtn: document.getElementById('stopBtn'),
-            urlInput: document.getElementById('urlInput'),
-            counter: document.getElementById('counter'),
-            accountStatusText: document.getElementById('accountStatusText'),
-            accountStatusBadge: document.getElementById('accountStatusBadge'),
-            usernameDisplay: document.getElementById('usernameDisplay'),
-            username: document.getElementById('username'),
-            progressBar: document.getElementById('progressBar'),
-            statsGrid: document.getElementById('statsGrid'),
-            successCount: document.getElementById('successCount'),
-            failedCount: document.getElementById('failedCount'),
-            successRate: document.getElementById('successRate'),
-            sessionTime: document.getElementById('sessionTime')
-        };
-
-        // সকেট ইভেন্ট
-        socket.on('connect', () => {
-            showToast('সার্ভারের সাথে সংযুক্ত', 'success');
-        });
-
-        socket.on('status_update', (data) => {
-            updateUI(data);
-        });
-
-        socket.on('connection_status', (data) => {
-            isConnected = data.connected;
-            if (data.username) {
-                elements.username.textContent = data.username;
-                elements.usernameDisplay.classList.add('show');
-            }
-            
-            if (isConnected) {
-                elements.accountStatusText.textContent = 'কানেক্টেড';
-                elements.accountStatusText.style.color = '#28a745';
-                elements.accountStatusBadge.textContent = '● কানেক্টেড';
-                elements.accountStatusBadge.className = 'status-badge badge-connected';
-                elements.connectBtn.disabled = true;
-                elements.connectBtn.innerHTML = '<i class="fas fa-check"></i> কানেক্টেড';
-                elements.urlInput.disabled = false;
-                
-                if (!isRunning) {
-                    elements.startBtn.disabled = false;
-                }
-                
-                showToast('✅ অ্যাকাউন্ট কানেক্টেড!', 'success');
-            } else {
-                elements.accountStatusText.textContent = 'ডিসকানেক্টেড';
-                elements.accountStatusText.style.color = '#dc3545';
-                elements.accountStatusBadge.textContent = '● ডিসকানেক্টেড';
-                elements.accountStatusBadge.className = 'status-badge badge-disconnected';
-                elements.connectBtn.disabled = false;
-                elements.connectBtn.innerHTML = '<i class="fas fa-plug"></i> অ্যাকাউন্ট কানেক্ট';
-                elements.urlInput.disabled = true;
-                elements.startBtn.disabled = true;
-                elements.stopBtn.disabled = true;
-                elements.usernameDisplay.classList.remove('show');
-            }
-        });
-
-        socket.on('automation_started', () => {
-            isRunning = true;
-            elements.startBtn.disabled = true;
-            elements.stopBtn.disabled = false;
-            elements.progressBar.classList.add('active');
-            elements.statsGrid.style.display = 'grid';
-            elements.urlInput.disabled = true;
-            
-            startSessionTimer();
-            showToast('▶️ অটোমেশন শুরু হয়েছে', 'success');
-        });
-
-        socket.on('automation_stopped', (data) => {
-            isRunning = false;
-            elements.startBtn.disabled = !isConnected;
-            elements.stopBtn.disabled = true;
-            elements.progressBar.classList.remove('active');
-            elements.urlInput.disabled = !isConnected;
-            
-            if (data.final_count) {
-                showToast(`⏹️ অটোমেশন বন্ধ | মোট ভিজিট: ${data.final_count}`, 'info');
-            }
-            
-            stopSessionTimer();
-        });
-
-        socket.on('visit_update', (data) => {
-            elements.counter.textContent = data.count;
-        });
-
-        socket.on('stats_update', (data) => {
-            elements.successCount.textContent = data.successful || 0;
-            elements.failedCount.textContent = data.failed || 0;
-            
-            const total = (data.successful || 0) + (data.failed || 0);
-            const rate = total > 0 ? Math.round((data.successful / total) * 100) : 0;
-            elements.successRate.textContent = rate + '%';
-        });
-
-        socket.on('error', (data) => {
-            showToast('❌ ' + data.message, 'error');
-        });
-
-        // ফাংশন
-        function connectAccount() {
-            socket.emit('connect_account');
-        }
-
-        function startAutomation() {
-            const url = elements.urlInput.value.trim();
-            if (!url) {
-                showToast('URL দিন!', 'warning');
-                return;
-            }
-            socket.emit('start_automation', { url: url });
-        }
-
-        function stopAutomation() {
-            socket.emit('stop_automation');
-        }
-
-        function updateUI(data) {
-            if (data.count !== undefined) elements.counter.textContent = data.count;
-            if (data.username) elements.username.textContent = data.username;
-        }
-
-        function startSessionTimer() {
-            sessionSeconds = 0;
-            if (sessionTimer) clearInterval(sessionTimer);
-            
-            sessionTimer = setInterval(() => {
-                sessionSeconds++;
-                const mins = Math.floor(sessionSeconds / 60);
-                const secs = sessionSeconds % 60;
-                elements.sessionTime.textContent = 
-                    `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-            }, 1000);
-        }
-
-        function stopSessionTimer() {
-            if (sessionTimer) {
-                clearInterval(sessionTimer);
-                sessionTimer = null;
-            }
-        }
-
-        function showToast(message, type = 'info') {
-            const toast = document.getElementById('toast');
-            const icon = document.getElementById('toastIcon');
-            const msg = document.getElementById('toastMessage');
-            
-            icon.className = 'fas';
-            
-            if (type === 'success') {
-                icon.className += ' fa-check-circle';
-                toast.className = 'toast show success';
-            } else if (type === 'error') {
-                icon.className += ' fa-exclamation-circle';
-                toast.className = 'toast show error';
-            } else if (type === 'warning') {
-                icon.className += ' fa-exclamation-triangle';
-                toast.className = 'toast show warning';
-            } else {
-                icon.className += ' fa-info-circle';
-                toast.className = 'toast show info';
-            }
-            
-            msg.textContent = message;
-            
-            setTimeout(() => {
-                toast.classList.remove('show');
-            }, 3000);
-        }
-
-        // এন্টার কী
-        elements.urlInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter' && !elements.startBtn.disabled) {
-                startAutomation();
-            }
-        });
-    </script>
-</body>
-</html>
-'''
-
-# ============ ব্রাউজার ফাংশন ============
-def init_browser():
-    """ব্রাউজার ইনিশিয়ালাইজ"""
-    try:
-        chrome_options = Options()
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1280,720')
-        chrome_options.add_argument(f'user-data-dir={USER_DATA_DIR}')
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36')
-        
-        # Render-এর জন্য হেডলেস মোড
-        chrome_options.add_argument('--headless=new')
-        
-        driver = webdriver.Chrome(options=chrome_options)
-        driver.set_page_load_timeout(30)
-        
-        bot.driver = driver
-        bot.wait = WebDriverWait(driver, 10)
-        
-        # TikTok লোড
-        driver.get("https://www.tiktok.com")
-        time.sleep(3)
-        
-        # কুকি চেক
-        check_login_status()
-        
-        return True
-    except Exception as e:
-        print(f"Browser init error: {e}")
-        return False
-
-def check_login_status():
-    """লগইন স্ট্যাটাস চেক"""
-    try:
-        # কুকি থেকে লগইন স্ট্যাটাস চেক
-        cookies = bot.driver.get_cookies()
-        for cookie in cookies:
-            if 'session' in cookie.get('name', '').lower() or 'sid' in cookie.get('name', '').lower():
-                bot.is_connected = True
-                
-                # ইউজারনেম বের করার চেষ্টা
-                try:
-                    bot.driver.get("https://www.tiktok.com")
-                    time.sleep(2)
-                    elements = bot.driver.find_elements(By.CSS_SELECTOR, '[data-e2e="user-avatar"]')
-                    if elements:
-                        bot.username = "TikTok User"
-                except:
-                    pass
-                
-                return True
-        
-        bot.is_connected = False
-        return False
-    except:
-        bot.is_connected = False
-        return False
-
-# ============ অটোমেশন লুপ ============
-def automation_loop(url):
-    """মেইন অটোমেশন লুপ"""
-    bot.is_running = True
-    bot.stop_flag = False
-    bot.current_url = url
-    
-    success_count = 0
-    fail_count = 0
-    
-    socketio.emit('automation_started')
-    
-    while bot.is_running and not bot.stop_flag:
-        try:
-            # ভিডিও পেজে যাওয়া
-            bot.driver.get(url)
-            time.sleep(2)
-            
-            # স্ক্রল
-            bot.driver.execute_script("window.scrollBy(0, 300)")
-            time.sleep(5)  # ৫ সেকেন্ড ভিউ
-            
-            if not bot.stop_flag:
-                with bot.lock:
-                    bot.visit_count += 1
-                    success_count += 1
-                    
-                socketio.emit('visit_update', {'count': bot.visit_count})
-                socketio.emit('stats_update', {
-                    'successful': success_count,
-                    'failed': fail_count
-                })
-                
-        except Exception as e:
-            fail_count += 1
-            socketio.emit('stats_update', {
-                'successful': success_count,
-                'failed': fail_count
-            })
-            time.sleep(2)
-    
-    bot.is_running = False
-    socketio.emit('automation_stopped', {'final_count': bot.visit_count})
-
-# ============ ফ্লাস্ক রুট ============
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE)
 
-@app.route('/api/status')
-def get_status():
-    return jsonify({
-        'connected': bot.is_connected,
-        'running': bot.is_running,
-        'count': bot.visit_count,
-        'username': bot.username
-    })
 
-# ============ সকেট ইভেন্ট ============
-@socketio.on('connect_account')
-def handle_connect():
-    try:
-        if not bot.driver:
-            if not init_browser():
-                socketio.emit('error', {'message': 'ব্রাউজার শুরু হয়নি'})
-                return
-        
-        # লগইন পেজ
-        bot.driver.get("https://www.tiktok.com/login")
-        time.sleep(2)
-        
-        # QR কোড বা ফোন নম্বর অপশন
+@app.route('/connect', methods=['POST'])
+def connect_account():
+    def open_login_browser():
         try:
-            # ফোন/ইমেইল অপশন ক্লিক
-            phone_option = bot.driver.find_element(By.XPATH, "//div[contains(text(), 'ফোন/ইমেইল')]")
-            phone_option.click()
-        except:
-            pass
-        
-        socketio.emit('connection_status', {
-            'connected': True,
-            'username': 'Logging in...'
-        })
-        
-        # লগইন মনিটর
-        def monitor_login():
-            for i in range(60):  # ৬০ সেকেন্ড
-                time.sleep(1)
-                if check_login_status():
-                    socketio.emit('connection_status', {
-                        'connected': True,
-                        'username': bot.username or 'TikTok User'
-                    })
-                    break
-        
-        thread = threading.Thread(target=monitor_login)
-        thread.daemon = True
-        thread.start()
-        
-    except Exception as e:
-        socketio.emit('error', {'message': f'কানেক্ট এরর: {str(e)}'})
+            pw, context = get_playwright_browser(headed=False)
+            page = context.new_page()
+            page.goto('https://www.tiktok.com/login', wait_until='domcontentloaded', timeout=30000)
+            socketio.emit('status_update', {'connected': False, 'message': 'Browser opened — please log in to TikTok, then click "Mark as Connected".'})
 
-@socketio.on('start_automation')
-def handle_start(data):
+            with state_lock:
+                state['browser'] = pw
+                state['context'] = context
+                state['page'] = page
+        except Exception as e:
+            socketio.emit('error', {'message': f'Failed to open browser: {str(e)}'})
+
+    t = threading.Thread(target=open_login_browser, daemon=True)
+    t.start()
+    return jsonify({'success': True, 'message': 'Opening browser...'})
+
+
+@app.route('/mark_connected', methods=['POST'])
+def mark_connected():
+    with state_lock:
+        state['connected'] = True
+    socketio.emit('status_update', {'connected': True, 'message': 'Status: Connected'})
+    return jsonify({'success': True})
+
+
+@app.route('/start', methods=['POST'])
+def start_loop():
+    data = request.get_json()
     url = data.get('url', '').strip()
-    
+
     if not url:
-        socketio.emit('error', {'message': 'URL দিন'})
-        return
-    
-    if not bot.driver or not bot.is_connected:
-        socketio.emit('error', {'message': 'প্রথমে অ্যাকাউন্ট কানেক্ট করুন'})
-        return
-    
-    if bot.is_running:
-        socketio.emit('error', {'message': 'অটোমেশন চলছে'})
-        return
-    
-    # ইউআরএল ভ্যালিডেশন
-    if not re.match(r'https?://(www\.)?tiktok\.com/@[\w.-]+/video/\d+', url):
-        socketio.emit('error', {'message': 'ভুল TikTok URL ফরম্যাট'})
-        return
-    
-    bot.visit_count = 0
-    thread = threading.Thread(target=automation_loop, args=(url,))
-    thread.daemon = True
-    thread.start()
+        return jsonify({'success': False, 'message': 'Please provide a TikTok video URL.'})
 
-@socketio.on('stop_automation')
-def handle_stop():
-    if bot.is_running:
-        bot.stop_flag = True
-        socketio.emit('status_update', {'message': 'স্টপ হচ্ছে...'})
-    else:
-        socketio.emit('error', {'message': 'কোন অটোমেশন চলছে না'})
+    if not url.startswith('http'):
+        return jsonify({'success': False, 'message': 'Invalid URL. Must start with http:// or https://'})
 
-# ============ ক্লিনআপ ============
-def cleanup():
-    if bot.driver:
+    with state_lock:
+        if state['is_running']:
+            return jsonify({'success': False, 'message': 'Loop is already running.'})
+        if not state['connected']:
+            return jsonify({'success': False, 'message': 'Please connect your TikTok account first.'})
+        state['stop_flag'] = False
+        state['is_running'] = True
+        state['visit_count'] = 0
+
+    def run_loop():
         try:
-            bot.driver.quit()
-        except:
-            pass
+            with state_lock:
+                context = state['context']
+                page = state['page']
 
-# ============ মেইন ============
+            if context is None:
+                socketio.emit('error', {'message': 'No browser session found. Please connect first.'})
+                with state_lock:
+                    state['is_running'] = False
+                return
+
+            while True:
+                with state_lock:
+                    if state['stop_flag']:
+                        break
+
+                try:
+                    page.goto(url, wait_until='domcontentloaded', timeout=30000)
+                except Exception as nav_err:
+                    socketio.emit('error', {'message': f'Navigation error: {str(nav_err)}'})
+                    break
+
+                time.sleep(5)
+
+                with state_lock:
+                    if state['stop_flag']:
+                        break
+                    state['visit_count'] += 1
+                    count = state['visit_count']
+
+                socketio.emit('visit_update', {'count': count})
+
+        except Exception as e:
+            socketio.emit('error', {'message': f'Loop error: {str(e)}'})
+        finally:
+            with state_lock:
+                state['is_running'] = False
+            socketio.emit('loop_stopped', {'message': 'Loop stopped.'})
+
+    t = threading.Thread(target=run_loop, daemon=True)
+    with state_lock:
+        state['loop_thread'] = t
+    t.start()
+    return jsonify({'success': True, 'message': 'Loop started!'})
+
+
+@app.route('/stop', methods=['POST'])
+def stop_loop():
+    with state_lock:
+        state['stop_flag'] = True
+    return jsonify({'success': True, 'message': 'Stop signal sent.'})
+
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    with state_lock:
+        return jsonify({
+            'connected': state['connected'],
+            'is_running': state['is_running'],
+            'visit_count': state['visit_count'],
+        })
+
+
 if __name__ == '__main__':
-    import atexit
-    atexit.register(cleanup)
-    
-    print("\n" + "="*60)
-    print("🎵 TikTok Mirror Controller v3.0 (Render-এর জন্য)")
-    print("="*60)
-    print("\n📱 সার্ভার চালু হচ্ছে...")
-    
-    # Render-এর পোর্ট এনভায়রনমেন্ট ভেরিয়েবল থেকে নেওয়া
     port = int(os.environ.get('PORT', 5000))
-    print(f"🌐 পোর্ট: {port}")
-    print("\n📱 নেটওয়ার্ক অ্যাড্রেস:")
-    print(f"   http://0.0.0.0:{port}")
-    print("\n⚠️  মনে রাখবেন:")
-    print("   1. প্রথমে 'অ্যাকাউন্ট কানেক্ট' এ ক্লিক করুন")
-    print("   2. TikTok এ লগইন করুন (হেডলেস ব্রাউজারে)")
-    print("   3. তারপর URL দিয়ে Start দিন")
-    print("="*60 + "\n")
-    
-    socketio.run(app, host='0.0.0.0', port=port, debug=False)
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, allow_unsafe_werkzeug=True)
+
+
+# Embedded HTML Template (original index.html)
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TikTok Mirror Controller</title>
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg-primary: #0a0a0a;
+            --bg-card: #161616;
+            --bg-input: #1e1e1e;
+            --accent: #fe2c55;
+            --accent-dark: #c0163c;
+            --accent-2: #25f4ee;
+            --text-primary: #ffffff;
+            --text-secondary: #a0a0a0;
+            --border: #2a2a2a;
+            --success: #25f4ee;
+            --error: #fe2c55;
+            --warning: #ffcc00;
+        }
+
+        body {
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+
+        header {
+            width: 100%;
+            padding: 20px 40px;
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg-card);
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .logo-icon {
+            width: 36px;
+            height: 36px;
+            background: var(--accent);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+
+        .logo h1 {
+            font-size: 1.4rem;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+        }
+
+        .logo h1 span { color: var(--accent); }
+
+        .header-badge {
+            margin-left: auto;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            border: 1px solid var(--border);
+            padding: 4px 10px;
+            border-radius: 20px;
+        }
+
+        main {
+            width: 100%;
+            max-width: 900px;
+            padding: 36px 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+
+        @media (max-width: 680px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 28px;
+        }
+
+        .card-title {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--text-secondary);
+            margin-bottom: 20px;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--text-secondary);
+            transition: background 0.3s;
+            flex-shrink: 0;
+        }
+
+        .status-dot.connected { background: var(--success); box-shadow: 0 0 8px var(--success); }
+        .status-dot.error { background: var(--error); }
+
+        .status-text {
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            transition: color 0.3s;
+        }
+
+        .status-text.connected { color: var(--success); }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 12px 22px;
+            border-radius: 10px;
+            border: none;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 600;
+            transition: all 0.2s;
+            width: 100%;
+        }
+
+        .btn:disabled {
+            opacity: 0.4;
+            cursor: not-allowed;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: #fff;
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: var(--accent-dark);
+            transform: translateY(-1px);
+        }
+
+        .btn-secondary {
+            background: var(--bg-input);
+            color: var(--text-primary);
+            border: 1px solid var(--border);
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            border-color: var(--accent-2);
+            color: var(--accent-2);
+        }
+
+        .btn-stop {
+            background: transparent;
+            color: var(--error);
+            border: 1px solid var(--error);
+        }
+
+        .btn-stop:hover:not(:disabled) {
+            background: var(--error);
+            color: #fff;
+        }
+
+        .btn-mark {
+            background: transparent;
+            color: var(--accent-2);
+            border: 1px solid var(--accent-2);
+            margin-top: 10px;
+        }
+
+        .btn-mark:hover:not(:disabled) {
+            background: var(--accent-2);
+            color: #000;
+        }
+
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+
+        label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            letter-spacing: 0.5px;
+        }
+
+        input[type="text"] {
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            color: var(--text-primary);
+            font-size: 0.9rem;
+            padding: 12px 16px;
+            width: 100%;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+
+        input[type="text"]:focus {
+            border-color: var(--accent);
+        }
+
+        input[type="text"]::placeholder {
+            color: #444;
+        }
+
+        .counter-display {
+            text-align: center;
+            padding: 24px 0;
+        }
+
+        .counter-number {
+            font-size: 3.5rem;
+            font-weight: 800;
+            line-height: 1;
+            background: linear-gradient(135deg, var(--accent), var(--accent-2));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .counter-label {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            margin-top: 6px;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        .progress-bar-wrap {
+            height: 4px;
+            background: var(--bg-input);
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 20px 0 0;
+        }
+
+        .progress-bar {
+            height: 100%;
+            width: 0%;
+            background: linear-gradient(90deg, var(--accent), var(--accent-2));
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }
+
+        .progress-bar.active {
+            animation: pulse-bar 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse-bar {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .pulse-ring {
+            display: none;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--accent);
+            box-shadow: 0 0 0 0 rgba(254, 44, 85, 0.7);
+            animation: pulse-ring 1.4s ease infinite;
+        }
+
+        .pulse-ring.active { display: inline-block; }
+
+        @keyframes pulse-ring {
+            0% { box-shadow: 0 0 0 0 rgba(254, 44, 85, 0.7); }
+            70% { box-shadow: 0 0 0 10px rgba(254, 44, 85, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(254, 44, 85, 0); }
+        }
+
+        .loop-status {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+            margin-bottom: 16px;
+        }
+
+        .btn-row {
+            display: flex;
+            gap: 10px;
+        }
+
+        .btn-row .btn { flex: 1; }
+
+        .toast-container {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            z-index: 9999;
+        }
+
+        .toast {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 14px 20px;
+            font-size: 0.85rem;
+            max-width: 320px;
+            animation: slide-in 0.3s ease;
+            border-left: 3px solid var(--accent-2);
+        }
+
+        .toast.error { border-left-color: var(--error); }
+        .toast.success { border-left-color: var(--success); }
+
+        @keyframes slide-in {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        .info-section {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 20px 28px;
+        }
+
+        .info-section h3 {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 1.5px;
+            color: var(--text-secondary);
+            margin-bottom: 12px;
+        }
+
+        .info-steps {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .info-steps li {
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            font-size: 0.85rem;
+            color: var(--text-secondary);
+        }
+
+        .step-num {
+            flex-shrink: 0;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            background: var(--bg-input);
+            border: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.7rem;
+            font-weight: 700;
+            color: var(--accent);
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="logo">
+            <div class="logo-icon">♾️</div>
+            <h1>TikTok <span>Mirror</span> Controller</h1>
+        </div>
+        <div class="header-badge">Auto-Loop Viewer</div>
+    </header>
+
+    <main>
+        <div class="grid">
+            <!-- Account Card -->
+            <div class="card">
+                <div class="card-title">Account Status</div>
+
+                <div class="status-indicator">
+                    <div class="status-dot" id="statusDot"></div>
+                    <span class="status-text" id="statusText">Not connected</span>
+                </div>
+
+                <p style="font-size:0.82rem;color:var(--text-secondary);margin-bottom:16px;line-height:1.5;">
+                    Click <strong style="color:var(--text-primary)">Connect Account</strong> to open a TikTok login window. Log in manually, then click <strong style="color:var(--accent-2)">Mark as Connected</strong>.
+                </p>
+
+                <button class="btn btn-primary" id="btnConnect" onclick="connectAccount()">
+                    🔗 Connect Account
+                </button>
+                <button class="btn btn-mark" id="btnMark" onclick="markConnected()" disabled>
+                    ✓ Mark as Connected
+                </button>
+            </div>
+
+            <!-- Counter Card -->
+            <div class="card">
+                <div class="card-title">Loop Statistics</div>
+                <div class="counter-display">
+                    <div class="counter-number" id="visitCount">0</div>
+                    <div class="counter-label">Total Visits</div>
+                </div>
+                <div class="progress-bar-wrap">
+                    <div class="progress-bar" id="progressBar"></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Automation Controls -->
+        <div class="card">
+            <div class="card-title">Automation Controls</div>
+
+            <div class="loop-status">
+                <span class="pulse-ring" id="pulseRing"></span>
+                <span id="loopStatusText">Idle — waiting to start</span>
+            </div>
+
+            <div class="input-group">
+                <label>TikTok Video URL</label>
+                <input
+                    type="text"
+                    id="videoUrl"
+                    placeholder="https://www.tiktok.com/@username/video/1234567890"
+                />
+            </div>
+
+            <div class="btn-row">
+                <button class="btn btn-secondary" id="btnStart" onclick="startLoop()">
+                    ▶ Start Loop
+                </button>
+                <button class="btn btn-stop" id="btnStop" onclick="stopLoop()" disabled>
+                    ■ Stop
+                </button>
+            </div>
+        </div>
+
+        <!-- How-to Section -->
+        <div class="info-section">
+            <h3>How to Use</h3>
+            <ul class="info-steps">
+                <li><span class="step-num">1</span> Click <strong>Connect Account</strong> — a browser window will open pointing to TikTok login.</li>
+                <li><span class="step-num">2</span> Log in to TikTok in the browser window. Your session is saved persistently.</li>
+                <li><span class="step-num">3</span> Return here and click <strong>Mark as Connected</strong>.</li>
+                <li><span class="step-num">4</span> Paste a TikTok video URL and click <strong>Start Loop</strong>.</li>
+                <li><span class="step-num">5</span> The counter updates in real-time. Click <strong>Stop</strong> to end the loop.</li>
+            </ul>
+        </div>
+    </main>
+
+    <div class="toast-container" id="toastContainer"></div>
+
+    <script>
+        const socket = io();
+        let visitCount = 0;
+        let isRunning = false;
+
+        socket.on('connect', () => {
+            fetchStatus();
+        });
+
+        socket.on('status_update', (data) => {
+            if (data.connected) {
+                setConnected(true);
+            }
+            if (data.message) showToast(data.message, data.connected ? 'success' : 'info');
+        });
+
+        socket.on('visit_update', (data) => {
+            visitCount = data.count;
+            document.getElementById('visitCount').textContent = visitCount;
+            animateProgress();
+        });
+
+        socket.on('loop_stopped', (data) => {
+            setRunning(false);
+            showToast(data.message || 'Loop stopped.', 'info');
+        });
+
+        socket.on('error', (data) => {
+            showToast(data.message, 'error');
+            setRunning(false);
+        });
+
+        function fetchStatus() {
+            fetch('/status')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.connected) setConnected(true);
+                    visitCount = data.visit_count;
+                    document.getElementById('visitCount').textContent = visitCount;
+                    if (data.is_running) setRunning(true);
+                });
+        }
+
+        function setConnected(val) {
+            const dot = document.getElementById('statusDot');
+            const txt = document.getElementById('statusText');
+            const btnMark = document.getElementById('btnMark');
+            if (val) {
+                dot.className = 'status-dot connected';
+                txt.textContent = 'Status: Connected';
+                txt.className = 'status-text connected';
+                btnMark.disabled = true;
+                document.getElementById('btnConnect').textContent = '✓ Browser Open';
+            } else {
+                btnMark.disabled = false;
+            }
+        }
+
+        function setRunning(val) {
+            isRunning = val;
+            const btnStart = document.getElementById('btnStart');
+            const btnStop = document.getElementById('btnStop');
+            const pulse = document.getElementById('pulseRing');
+            const statusTxt = document.getElementById('loopStatusText');
+            const bar = document.getElementById('progressBar');
+
+            if (val) {
+                btnStart.disabled = true;
+                btnStop.disabled = false;
+                pulse.classList.add('active');
+                statusTxt.textContent = 'Running — visiting every 5 seconds';
+                bar.classList.add('active');
+                bar.style.width = '100%';
+            } else {
+                btnStart.disabled = false;
+                btnStop.disabled = true;
+                pulse.classList.remove('active');
+                statusTxt.textContent = 'Idle — waiting to start';
+                bar.classList.remove('active');
+                bar.style.width = '0%';
+            }
+        }
+
+        function animateProgress() {
+            const bar = document.getElementById('progressBar');
+            bar.style.width = '100%';
+        }
+
+        function connectAccount() {
+            document.getElementById('btnConnect').disabled = true;
+            document.getElementById('btnMark').disabled = false;
+            fetch('/connect', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    showToast(data.message || 'Browser opening...', 'info');
+                })
+                .catch(() => {
+                    showToast('Failed to connect. Try again.', 'error');
+                    document.getElementById('btnConnect').disabled = false;
+                });
+        }
+
+        function markConnected() {
+            fetch('/mark_connected', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    setConnected(true);
+                    showToast('Account marked as connected!', 'success');
+                });
+        }
+
+        function startLoop() {
+            const url = document.getElementById('videoUrl').value.trim();
+            if (!url) {
+                showToast('Please enter a TikTok video URL.', 'error');
+                return;
+            }
+            fetch('/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ url })
+            })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    visitCount = 0;
+                    document.getElementById('visitCount').textContent = '0';
+                    setRunning(true);
+                    showToast(data.message, 'success');
+                } else {
+                    showToast(data.message, 'error');
+                }
+            });
+        }
+
+        function stopLoop() {
+            fetch('/stop', { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    showToast(data.message, 'info');
+                });
+        }
+
+        function showToast(message, type = 'info') {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.textContent = message;
+            container.appendChild(toast);
+            setTimeout(() => {
+                toast.style.opacity = '0';
+                toast.style.transition = 'opacity 0.4s';
+                setTimeout(() => toast.remove(), 400);
+            }, 4000);
+        }
+    </script>
+</body>
+</html>
+"""
